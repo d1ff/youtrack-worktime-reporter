@@ -1,6 +1,7 @@
 from youtrack.connection import Connection as YouTrack
 from influxdb import InfluxDBClient
 from collections import defaultdict
+import pprint
 import os
 import sys
 import itertools
@@ -27,6 +28,7 @@ class YouTrackExporter(object):
             skip = 0
             while True:
                 issues = self.yt.getIssues(project.id,
+                                           # "#RR-1234", skip, 50)
                                            'Spent time: -?', skip, 50)
                 if not issues:
                     break
@@ -41,19 +43,58 @@ class YouTrackExporter(object):
         target = getattr(issue, 'Target', 'Core')
         _type = getattr(issue, 'Type', None)
         resolved = getattr(issue, 'resolved', None)
-        estimation = getattr(issue, 'Estimation', None)
+        estimation = int(getattr(issue, 'Estimation', 0))
         tags = {
             'project': project.id,
             'issue': issue.id,
+            'title': issue.summary,
             'stream': stream,
             'target': target,
             'type': _type
         }
         counter = defaultdict(lambda: 0)
+        created = int(getattr(issue, 'created', 0))
+        if created:
+            yield {
+                'measurement': 'issue',
+                'tags': tags,
+                'time': created,
+                'fields': {
+                    'Analytics': 0,
+                    'Development': 0,
+                    'Testing': 0,
+                    'cycle_time': 0,
+                    'state': 'Submitted'
+                }
+            }
+        states = []
+        last_state_update = int(created)
+        last_state = 'Submitted'
+        for change in self.yt.get_changes_for_issue(issue.id):
+            for f in change.fields:
+                if f.name == 'State':
+                    fields = {
+                        'state': f.new_value[0]
+                    }
+                    if estimation:
+                        fields['estimation'] = estimation
+                    u = int(change.updated)
+                    yield {
+                        'measurement': 'issue',
+                        'tags': tags,
+                        'time': u,
+                        'fields': fields
+                    }
+                    states.append(
+                        (last_state_update, u, f.old_value[0])
+                    )
+                    last_state_update = u
+                    last_state = f.new_value[0]
+        states.append((last_state_update, last_state_update + 365*24*60*60*1000, last_state))
         for work_item in self.yt.getWorkItems(issue.id):
             _tags = dict(tags)
             _tags['author'] = getattr(work_item, 'authorLogin', None)
-            created = getattr(work_item, 'created', None)
+            created = int(getattr(work_item, 'created', 0))
             work_type = getattr(work_item, 'worktype', None)
             date = getattr(work_item, 'date', created)
             duration = int(work_item.duration)
@@ -64,7 +105,7 @@ class YouTrackExporter(object):
             time_dt = datetime.datetime.combine(date_dt.date(), created_dt.time(), date_dt.tzinfo)
             time_ts = int(datetime.datetime.timestamp(time_dt)*1000)
             counter[work_type] += duration
-            yield {
+            measure = {
                 'measurement': 'work_item',
                 'tags': _tags,
                 'time': time_ts,
@@ -72,27 +113,28 @@ class YouTrackExporter(object):
                     work_type: duration
                 }
             }
+            yield measure
 
-        cycle_time = counter['Analytics'] + counter['Development'] + counter['Testing']
-        created = getattr(issue, 'created', None)
-        if estimation:
-            yield {
-                'measurement': 'issue',
-                'tags': tags,
-                'time': int(created),
-                'fields': {
-                    'estimation': int(estimation)
-                }
+            cycle_time = counter['Analytics'] + counter['Development'] + counter['Testing']
+            fields = {
+                'Analytics': counter['Analytics'],
+                'Development': counter['Development'],
+                'Testing': counter['Testing'],
+                'cycle_time': cycle_time,
             }
-        if lead_time and resolved:
+            if estimation:
+                fields['estimation'] = estimation
+            if lead_time:
+                fields['lead_time'] = float(lead_time)
+            for _l, r, s in states:
+                if _l <= time_ts < r:
+                    fields['state'] = s
+                    break
             yield {
                 'measurement': 'issue',
                 'tags': tags,
-                'time': int(resolved),
-                'fields': {
-                    'lead_time': float(lead_time),
-                    'cycle_time': cycle_time,
-                }
+                'time': time_ts,
+                'fields': fields
             }
 
     def process_project(self, project):
@@ -125,13 +167,17 @@ class YouTrackExporter(object):
 
         measurements = itertools.chain.from_iterable(_gen())
         for chunk in grouper(measurements, 50):
-            filtered = filter(lambda x: x is not None, chunk)
+            filtered = list(filter(lambda x: x is not None, chunk))
+            # pprint.pprint(filtered)
             self.influx.write_points(filtered, time_precision='ms')
 
 
 def main():
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger('main')
+    requests_log = logging.getLogger("requests.packages.urllib3")
+    requests_log.setLevel(logging.DEBUG)
+    requests_log.propagate = True
     try:
         load_dotenv()
         exporter = YouTrackExporter(
