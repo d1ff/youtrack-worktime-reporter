@@ -1,6 +1,10 @@
-from youtrack.connection import Connection as YouTrack
+import urllib3
+
+urllib3.disable_warnings()
+
 from influxdb import InfluxDBClient
 from collections import defaultdict
+import requests
 import pprint
 import os
 import sys
@@ -14,6 +18,41 @@ def grouper(iterable, n, fillvalue=None):
     args = [iter(iterable)] * n
     return itertools.zip_longest(*args, fillvalue=fillvalue)
 
+class YouTrack(object):
+
+    def __init__(self, url, token):
+        self._url = url
+        self._token = token
+        self._session = requests.Session()
+        self._session.headers['Authorization'] = f'Bearer {self._token}'
+
+    def getIssues(self, project_id, query, skip, top):
+        fields = "summary,customFields(name,value(minutes,name)),created,resolved,idReadable"
+        params = {'fields': fields, '$top': top, '$skip': skip,
+                  'query': f'#{project_id} {query}'}
+        with self._session.get(f'{self._url}/api/issues', params=params) as r:
+            return r.json()
+
+    def get_changes_for_issue(self, issue_id):
+        return []
+
+    def getWorkItems(self, issue_id):
+        fields = "author(login),created,type(name),date,duration(minutes)"
+        params = {'fields': fields,
+                  'query': f'#{issue_id}'}
+        with self._session.get(f'{self._url}/api/workItems', params=params) as r:
+            return r.json()
+
+    def getProjectTimeTrackingSettings(self, project):
+        fields = "enabled"
+        with self._session.get(f'{self._url}/api/admin/projects/{project["id"]}/timeTrackingSettings',
+                               params={'fields': fields}) as r:
+            return r.json()
+
+    def getProjects(self):
+        fields = "shortName,description,id"
+        with self._session.get(f'{self._url}/api/admin/projects', params={'fields': fields}) as r:
+            return r.json()
 
 class YouTrackExporter(object):
 
@@ -21,39 +60,51 @@ class YouTrackExporter(object):
         self.yt = YouTrack(**yt)
         self.influx = InfluxDBClient(**influx)
         self.logger = logging.getLogger('worktime_reporter')
-        self.project_blacklist = ['RRS', 'RR_INS']
+        self.project_blacklist = ['RRS', 'RR_INS', 'TPLABTMPL']
 
     def get_all_issues(self, project):
         def _gen():
             skip = 0
             while True:
-                issues = self.yt.getIssues(project.id,
+                issues = self.yt.getIssues(project['shortName'],
                                            # "#RR-1234", skip, 50)
-                                           'Spent time: -?', skip, 50)
+                                           'Spent time: -?', skip=skip, top=50)
                 if not issues:
                     break
                 skip += len(issues)
                 yield issues
         return itertools.chain.from_iterable(_gen())
 
+    def get_custom_field(self, issue, name, default=None):
+        for field in issue["customFields"]:
+            if name == field['name']:
+                value = field['value']
+                if value:
+                    if isinstance(value, dict):
+                        if value['$type'] == 'EnumBundleElement':
+                            return value.get('name', default)
+                        if value['$type'] == 'PeriodValue':
+                            return value.get('minutes', default)
+                    return value
+        return default
+
     def issue_to_measurement(self, project, issue):
-        self.logger.info(f'Looking into issue {issue.id}')
-        lead_time = getattr(issue, 'Lead time', None)
-        stream = getattr(issue, 'Stream', None)
-        target = getattr(issue, 'Target', 'Core')
-        _type = getattr(issue, 'Type', None)
-        resolved = getattr(issue, 'resolved', None)
-        estimation = int(getattr(issue, 'Estimation', 0))
+        self.logger.info(f'Looking into issue {issue["idReadable"]}')
+        lead_time = self.get_custom_field(issue, 'Lead time')
+        stream = self.get_custom_field(issue, 'Stream')
+        target = self.get_custom_field(issue, 'Target', 'Core')
+        _type = self.get_custom_field(issue, 'Type')
+        estimation = int(self.get_custom_field(issue, 'Estimation', 0))
         tags = {
-            'project': project.id,
-            'issue': issue.id,
-            'title': issue.summary,
+            'project': project['shortName'],
+            'issue': issue["idReadable"],
+            'title': issue["summary"],
             'stream': stream,
             'target': target,
             'type': _type
         }
         counter = defaultdict(lambda: 0)
-        created = int(getattr(issue, 'created', 0))
+        created = int(issue['created'])
         if created:
             yield {
                 'measurement': 'issue',
@@ -70,7 +121,7 @@ class YouTrackExporter(object):
         states = []
         last_state_update = int(created)
         last_state = 'Submitted'
-        for change in self.yt.get_changes_for_issue(issue.id):
+        for change in self.yt.get_changes_for_issue(issue['idReadable']):
             for f in change.fields:
                 if f.name == 'State':
                     fields = {
@@ -91,13 +142,13 @@ class YouTrackExporter(object):
                     last_state_update = u
                     last_state = f.new_value[0]
         states.append((last_state_update, last_state_update + 365*24*60*60*1000, last_state))
-        for work_item in self.yt.getWorkItems(issue.id):
+        for work_item in self.yt.getWorkItems(issue['idReadable']):
             _tags = dict(tags)
-            _tags['author'] = getattr(work_item, 'authorLogin', None)
-            created = int(getattr(work_item, 'created', 0))
-            work_type = getattr(work_item, 'worktype', None)
-            date = getattr(work_item, 'date', created)
-            duration = int(work_item.duration)
+            _tags['author'] = work_item['author']['login']
+            created = int(work_item['created'])
+            work_type = work_item['type']['name']
+            date = work_item.get('date', created)
+            duration = work_item['duration']['minutes']
             if not created:
                 continue
             created_dt = datetime.datetime.fromtimestamp(float(created)/1000)
@@ -138,17 +189,17 @@ class YouTrackExporter(object):
             }
 
     def process_project(self, project):
-        if project.id in self.project_blacklist:
-            self.logger.info(f'Skipping project {project.id}, blacklisted')
+        if project['shortName'] in self.project_blacklist:
+            self.logger.info(f'Skipping project {project["shortName"]}, blacklisted')
             return
 
-        ts = self.yt.getProjectTimeTrackingSettings(project['id'])
-        if not ts.Enabled:
+        ts = self.yt.getProjectTimeTrackingSettings(project)
+        if not ts["enabled"]:
             self.logger.info(
-                f'Skipping project {project.id}, no time tracking')
+                f'Skipping project {project["shortName"]}, no time tracking')
             return
 
-        self.logger.info(f'Looking into project {project.id}')
+        self.logger.info(f'Looking into project {project["shortName"]}')
         issues = self.get_all_issues(project)
         measurements = (self.issue_to_measurement(project, issue) for issue in issues)
         return itertools.chain.from_iterable(measurements)
@@ -156,8 +207,7 @@ class YouTrackExporter(object):
     def export(self):
         def _gen():
             projects = self.yt.getProjects()
-            for project_id in projects:
-                project = self.yt.getProject(project_id)
+            for project in projects:
                 measurements = self.process_project(project)
                 if measurements:
                     yield measurements
@@ -173,7 +223,7 @@ class YouTrackExporter(object):
 
 
 def main():
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger('main')
     requests_log = logging.getLogger("requests.packages.urllib3")
     requests_log.setLevel(logging.DEBUG)
