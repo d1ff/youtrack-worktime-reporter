@@ -34,7 +34,10 @@ class YouTrack(object):
             return r.json()
 
     def get_changes_for_issue(self, issue_id):
-        return []
+        fields = "field(name,presentation),timestamp,target,targetMember,added(name),removed(name)"
+        params = {'fields': fields, 'categories': 'CustomFieldCategory'}
+        with self._session.get(f'{self._url}/api/issues/{issue_id}/activities', params=params) as r:
+            return r.json()
 
     def getWorkItems(self, issue_id):
         fields = "author(login),created,type(name),date,duration(minutes)"
@@ -122,25 +125,24 @@ class YouTrackExporter(object):
         last_state_update = int(created)
         last_state = 'Submitted'
         for change in self.yt.get_changes_for_issue(issue['idReadable']):
-            for f in change.fields:
-                if f.name == 'State':
-                    fields = {
-                        'state': f.new_value[0]
-                    }
-                    if estimation:
-                        fields['estimation'] = estimation
-                    u = int(change.updated)
-                    yield {
-                        'measurement': 'issue',
-                        'tags': tags,
-                        'time': u,
-                        'fields': fields
-                    }
-                    states.append(
-                        (last_state_update, u, f.old_value[0])
-                    )
-                    last_state_update = u
-                    last_state = f.new_value[0]
+            if change['field']['name'] == 'State':
+                fields = {
+                    'state': change['added'][0]['name']
+                }
+                if estimation:
+                    fields['estimation'] = estimation
+                u = int(change['timestamp'])
+                yield {
+                    'measurement': 'issue',
+                    'tags': tags,
+                    'time': u,
+                    'fields': fields
+                }
+                states.append(
+                    (last_state_update, u, change['removed'][0]['name'])
+                )
+                last_state_update = u
+                last_state = change['added'][0]['name']
         states.append((last_state_update, last_state_update + 365*24*60*60*1000, last_state))
         for work_item in self.yt.getWorkItems(issue['idReadable']):
             _tags = dict(tags)
